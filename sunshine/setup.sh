@@ -261,8 +261,11 @@ create_steamuser() {
             echo "steamuser:steamuser" | chpasswd
         fi
         usermod -aG video,render,input,audio steamuser 2>/dev/null || true
-        # Allow steamuser to use GPU devices
+        # Allow steamuser to use GPU and input devices
         chmod 666 /dev/nvidia* /dev/dri/renderD* /dev/uinput 2>/dev/null || true
+        # Ensure runtime dir exists
+        mkdir -p /run/user/1000
+        chown steamuser:steamuser /run/user/1000
     '
     log "steamuser created (password: steamuser — change it!)."
 }
@@ -389,6 +392,35 @@ install_steam_deps() {
 }
 
 # ---------------------------------------------------------------------------
+# 10. Setup PulseAudio for streaming audio
+# ---------------------------------------------------------------------------
+setup_pulseaudio() {
+    log "=== Step 10: Setup PulseAudio ==="
+    pct exec "$CTID" -- bash -c '
+        apt-get install -y pulseaudio
+        # Run PulseAudio in system mode so Sunshine can access it
+        pulseaudio --system --daemonize || true
+        # Persist across reboots
+        cat > /etc/systemd/system/pulseaudio-system.service << EOF
+[Unit]
+Description=PulseAudio System Mode
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/pulseaudio --system --daemonize
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable pulseaudio-system || true
+    '
+    log "PulseAudio configured."
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 main() {
@@ -404,6 +436,7 @@ main() {
     configure_display
     setup_sunshine_service
     install_steam_deps
+    setup_pulseaudio
 
     log ""
     log "=========================================="
@@ -413,6 +446,7 @@ main() {
     log "Login as steamuser (password: steamuser)"
     log "Change the password and pair with Moonlight."
     log "To launch Steam: su - steamuser -c 'DISPLAY=:99 steam'"
+    log "If keyboard input fails, disable Steam Input for the game."
     log "=========================================="
 }
 
