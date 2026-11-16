@@ -268,10 +268,127 @@ create_steamuser() {
 }
 
 # ---------------------------------------------------------------------------
-# 6. Install Sunshine
+# 6. Install Steam and 32-bit dependencies in the CT
+# ---------------------------------------------------------------------------
+install_steam() {
+    log "=== Step 6: Install Steam and 32-bit dependencies in CT ==="
+    if pct exec "$CTID" -- bash -c '
+        set -euo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+
+        apt-get update -qq
+        apt-get install -y ca-certificates curl debconf
+
+        dpkg --add-architecture i386
+
+        # Enable distro components needed for steam-installer / steam-libs-i386
+        # (Ubuntu: universe + multiverse; Debian: contrib + non-free + non-free-firmware).
+        # Handles both one-line sources.list and deb822 *.sources.
+        . /etc/os-release
+        components=()
+        case "${ID:-}" in
+            ubuntu) components=(universe multiverse) ;;
+            debian) components=(contrib non-free non-free-firmware) ;;
+            *) echo "Unknown distro ${ID:-unknown}; not changing apt components." ;;
+        esac
+
+        add_missing_components() {
+            local file="$1"
+            shift
+            [[ -f "$file" ]] || return 0
+            local needed=("$@")
+            local changed=0 line comp tmp
+            tmp=$(mktemp)
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "${line}" ]]; then
+                    printf "%s\n" "$line"
+                    continue
+                fi
+                if [[ "$line" =~ ^Components: ]] || [[ "$line" =~ ^deb(-src)?[[:space:]] ]]; then
+                    for comp in "${needed[@]}"; do
+                        if ! [[ "$line" =~ [[:space:]]${comp}([[:space:]]|$) ]]; then
+                            if [[ "$line" =~ ^Components: ]] || [[ "$line" =~ [[:space:]]main([[:space:]]|$) ]]; then
+                                line="$line $comp"
+                                changed=1
+                            fi
+                        fi
+                    done
+                fi
+                printf "%s\n" "$line"
+            done < "$file" > "$tmp"
+            if [[ $changed -eq 1 ]]; then
+                cat "$tmp" > "$file"
+            fi
+            rm -f "$tmp"
+        }
+
+        if [[ ${#components[@]} -gt 0 ]]; then
+            shopt -s nullglob
+            for src in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+                [[ -f "$src" ]] || continue
+                grep -qE "ubuntu\\.com|debian\\.org|debian-security" "$src" || continue
+                add_missing_components "$src" "${components[@]}"
+            done
+            shopt -u nullglob
+        fi
+
+        # Valve apt repo (provides steam-launcher). Best-effort; fallback is steam-installer.
+        mkdir -p /usr/share/keyrings
+        if [[ ! -s /usr/share/keyrings/steam.gpg ]]; then
+            if curl -fsSL https://repo.steampowered.com/steam/archive/stable/steam.gpg -o /tmp/steam.gpg; then
+                mv /tmp/steam.gpg /usr/share/keyrings/steam.gpg
+            else
+                echo "WARN: Could not download Valve Steam signing key; will try distro packages."
+            fi
+        fi
+        if [[ -s /usr/share/keyrings/steam.gpg ]] && ! grep -qR "repo.steampowered.com/steam" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+            cat > /etc/apt/sources.list.d/steam-stable.list << EOF
+deb [arch=amd64,i386 signed-by=/usr/share/keyrings/steam.gpg] https://repo.steampowered.com/steam/ stable steam
+EOF
+        fi
+
+        if ! apt-get update -qq; then
+            echo "WARN: apt-get update failed; retrying without the Valve Steam repo."
+            rm -f /etc/apt/sources.list.d/steam-stable.list
+            apt-get update -qq
+        fi
+
+        echo "steam steam/question select I AGREE" | debconf-set-selections
+        echo "steam steam/license note " | debconf-set-selections
+
+        STEAM_DEPS=(
+            libegl1:i386
+            libgbm1:i386
+            libgl1-mesa-dri:i386
+            libgl1:i386
+            xdg-desktop-portal
+            xdg-desktop-portal-gtk
+        )
+
+        if apt-get install -y "${STEAM_DEPS[@]}" steam-launcher steam-libs-i386:i386; then
+            echo "Installed steam-launcher and 32-bit Steam dependencies."
+        elif apt-cache show steam-launcher >/dev/null 2>&1 && apt-get install -y "${STEAM_DEPS[@]}" steam-launcher; then
+            echo "Installed steam-launcher and 32-bit dependencies (without steam-libs-i386)."
+        elif apt-get install -y "${STEAM_DEPS[@]}" steam-installer; then
+            echo "steam-launcher not available; installed steam-installer and 32-bit dependencies."
+        elif apt-get install -y steam-installer; then
+            echo "Installed steam-installer (Steam will pull remaining libraries)."
+        else
+            echo "ERROR: Failed to install Steam packages." >&2
+            exit 1
+        fi
+    '; then
+        log "Steam and 32-bit dependencies installed in CT."
+    else
+        warn "Steam dependency installation failed. You can install Steam later inside the CT."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 7. Install Sunshine
 # ---------------------------------------------------------------------------
 install_sunshine() {
-    log "=== Step 6: Install Sunshine ==="
+    log "=== Step 7: Install Sunshine ==="
     pct exec "$CTID" -- bash -c '
         apt-get update -qq
         apt-get install -y wget curl xvfb
@@ -298,10 +415,10 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# 7. Configure resolution / virtual display
+# 8. Configure resolution / virtual display
 # ---------------------------------------------------------------------------
 configure_display() {
-    log "=== Step 7: Configure virtual display resolution ==="
+    log "=== Step 8: Configure virtual display resolution ==="
     local res
     res=$(select_from_list RESOLUTIONS "Select virtual display resolution:")
     log "Selected resolution: $res"
@@ -321,10 +438,10 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# 8. Create Sunshine systemd service
+# 9. Create Sunshine systemd service
 # ---------------------------------------------------------------------------
 setup_sunshine_service() {
-    log "=== Step 8: Create Sunshine systemd service ==="
+    log "=== Step 9: Create Sunshine systemd service ==="
     pct exec "$CTID" -- bash -c '
         cat > /etc/systemd/system/sunshine.service << EOF
 [Unit]
@@ -365,6 +482,7 @@ main() {
     apply_nvidia_passthrough
     install_ct_nvidia_userspace
     create_steamuser
+    install_steam
     install_sunshine
     configure_display
     setup_sunshine_service
